@@ -3717,6 +3717,20 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << rankedTy.getShape()
                          << " which is not a power of two.";
       }
+      if (isa<DotOperandEncodingAttr, NvidiaMmaEncodingAttr>(layout)) {
+        ModuleOp module = op->getParentOfType<ModuleOp>();
+        auto target = module->getAttrOfType<StringAttr>(AttrTargetName);
+        int computeCapability = target && target.getValue().starts_with("cuda:")
+                                    ? getNVIDIAComputeCapability(module)
+                                    : 0;
+        if (computeCapability > 0 && computeCapability < 80) {
+          return makeErr()
+                 << "NPOT dot/MMA layout is not yet supported for NVIDIA "
+                    "compute capability "
+                 << computeCapability
+                 << "; compute capability 80 or newer is required.";
+        }
+      }
       // Layouts whose modular (non-power-of-2) lowering is implemented.
       // Dot-operand and MMA encodings (Nvidia WGMMA/MMAv5, AMD MFMA/WMMA) are
       // admitted so an NPOT tl.dot's operand/result tensors pass verification
