@@ -11,6 +11,8 @@
 //
 #include "mlir/IR/TypeUtilities.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/MathExtras.h"
 #include <iterator>
 #include <type_traits>
 
@@ -22,6 +24,79 @@ using namespace mlir::triton;
 namespace mlir::triton {
 class ReduceOp;
 class ScanOp;
+
+// === NPOT pow2-rounding phantom register detection (shared reduce/scan) ===
+//
+// When the true contiguous-per-thread run on the reduction/scan axis is not a
+// power of two (e.g. a [rows, 96] tensor at num_warps=1: lane stride 3 on the
+// axis), the LinearLayout rounds the per-thread register dim up to the next
+// power of two (register axis bases [1, 2] -> 4 register slots with axis
+// offsets 0,1,2,3). The extra register slot is NOT out-of-range: with lane
+// stride == the true contig, register i of lane L aliases a lower register of
+// lane L+1 (offset 3 of lane L == offset 0 of lane L+1), so it DUPLICATES a
+// real element. Folding all register rows within the thread therefore counts
+// that duplicate in two lanes' partials -> it is double-counted after the
+// cross-lane fold (an all-ones [rows, 96] reduce at num_warps=1 yields 128
+// instead of 96; the out-of-range masker alone leaves 127 -- it catches only
+// the single lane whose duplicate lands past dimSize).
+//
+// NOTE: the "true contig" here is the lane stride on the axis (the smallest
+// positive lane-basis axis offset), NOT getContigPerThread() -- that walks the
+// register bases and reports the pow2-rounded run (4 above), which hides the
+// duplicate. Use getReductionAxisLaneStride() below.
+//
+// The out-of-range masker (offset >= dimSize) misses these because they are
+// IN-range duplicates. This helper flags them instead: a register index is a
+// pow2-rounding phantom when its within-tile axis position lies in
+// [contigPerThread, NextPow2(contigPerThread)). Callers identity-fill those
+// slots (for all lanes) before the within-thread fold.
+//
+// `offsets` must be emitOffsetForLayout(srcLayout, type): offsets[i][axis] is
+// the axis offset of register i at lane=warp=0. `contigPerThread` is the lane
+// stride on the axis. Returns the register indices (into the per-thread value
+// vector) that are phantoms. Empty when contigPerThread is a power of two (or
+// 0) -> pow2/N=48/64/192 stay byte-identical.
+//
+// TODO: ScanOpToLLVM (scan/cumsum) has the same pow2-rounding duplicate on its
+// within-thread scan and should reuse this (with getReductionAxisLaneStride) to
+// identity-fill the phantom registers before scanning.
+inline llvm::SmallDenseSet<unsigned>
+getPow2RoundingPhantomRegisters(ArrayRef<SmallVector<unsigned>> offsets,
+                                unsigned axis, unsigned contigPerThread) {
+  llvm::SmallDenseSet<unsigned> phantom;
+  if (contigPerThread == 0)
+    return phantom;
+  unsigned pow2Contig = llvm::PowerOf2Ceil(contigPerThread);
+  // Power-of-two contig: no rounding, so no phantom slots (byte-identical).
+  if (pow2Contig == contigPerThread)
+    return phantom;
+  for (unsigned i = 0; i < offsets.size(); ++i) {
+    unsigned withinTile = offsets[i][axis] % pow2Contig;
+    if (withinTile >= contigPerThread)
+      phantom.insert(i);
+  }
+  return phantom;
+}
+
+// The true contiguous-per-thread run on `axis`: the smallest positive lane
+// basis axis offset (the stride to the neighbouring thread on the axis).
+// Returns 0 when no lane basis moves along the axis (the axis lives entirely in
+// registers/warps, so there is no register-vs-lane pow2-rounding duplicate).
+// `ll` is the source LinearLayout, toLinearLayout(srcShape, srcEncoding).
+inline unsigned getReductionAxisLaneStride(const LinearLayout &ll,
+                                           unsigned axis) {
+  unsigned stride = 0;
+  for (const auto &[inDim, bases] : ll.getBases()) {
+    if (inDim.str() != "lane")
+      continue;
+    for (const auto &basis : bases) {
+      unsigned off = static_cast<unsigned>(basis[axis]);
+      if (off > 0 && (stride == 0 || off < stride))
+        stride = off;
+    }
+  }
+  return stride;
+}
 
 inline SmallVector<Value>
 inlineCombineBlock(ConversionPatternRewriter &rewriter, Block &combineBlock,

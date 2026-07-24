@@ -6,6 +6,8 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -20,6 +22,99 @@ Value bitOrPtrCast(Value val, Type type, TritonLLVMOpBuilder &b) {
   } else {
     return b.bitcast(val, type);
   }
+}
+
+// === NPOT modular view-op register remap (broadcast / expand_dims) ===
+//
+// The default BroadcastOp/ExpandDims lowerings match src<->result registers by
+// their per-register offset via a std::map keyed on emitOffsetForLayout().
+// Under a modular (non-power-of-2) layout that is unsafe: the source of a
+// broadcast / expand carries FREE (broadcast) registers, so several source
+// registers collapse onto one offset key -- the map keeps only the last, and
+// some result offsets have no matching key at all (std::map::at throws ->
+// compile crash), or resolve to the wrong element. Random NPOT shapes hit this
+// (e.g. a per-row value broadcast over an NPOT column extent).
+//
+// Instead, compose the layouts. `srcLL` and `resLL` are the source and result
+// layouts already projected onto a COMMON set of out-dims (the caller drops the
+// expanded / broadcast dims via removeStandardDim). We map each result register
+// to the source register holding the same logical element:
+//   1. strip the source's FREE (broadcast) registers so srcVals is the
+//      canonical, non-degenerate set (mirrors CatOpConversion /
+//      transferWithinBlockSwizzlingImpl);
+//   2. round every out-dim size up to the next power of two, rebuilding a new
+//   LL
+//      (resizeOutDim can only shrink). Modular layouts' bases already span
+//      exactly that pow2 range (pow2 tiling + a UREM fold), so the rounded LLs
+//      are surjective and NON-modular. That makes invertAndCompose take the
+//      plain GF(2) path and avoids its modular kernel-equivalence fold, which
+//      otherwise mis-maps high-phase result registers back to source register
+//      0;
+//   3. conv = resP.invertAndCompose(srcP): conv(register=i) is the source
+//      register with the same logical position (lane/warp/block are identity in
+//      this within-thread remap);
+//   4. read the register out-component of conv per result register.
+//
+// A guard rejects (loud failure -> std::nullopt) any composition where lane /
+// warp / block leak into the register out-component, rather than silently
+// miscomputing. Only reached when a layout is modular (TRITON_ALLOW_NPOT); the
+// power-of-2 path is untouched and byte-identical.
+static std::optional<SmallVector<Value>>
+remapModularViewRegisters(MLIRContext *ctx, LinearLayout srcLL,
+                          LinearLayout resLL, SmallVector<Value> srcVals) {
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  StringAttr kWarp = StringAttr::get(ctx, "warp");
+  StringAttr kBlock = StringAttr::get(ctx, "block");
+
+  // 1. Strip src broadcast (free) registers.
+  auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLL);
+  if (!removeBroadcastSrc.isIdentity()) {
+    srcLL = removeBroadcastSrc.apply(srcLL);
+    srcVals = removeBroadcastSrc.apply(srcVals);
+  }
+
+  // 2. Round out-dim sizes up to pow2 (new LL; resizeOutDim only shrinks).
+  auto roundOutDimsToPow2 = [&](const LinearLayout &ll) {
+    auto outDims = ll.getOutDims();
+    for (auto &d : outDims)
+      d.second = static_cast<int32_t>(llvm::PowerOf2Ceil(
+          static_cast<uint64_t>(static_cast<uint32_t>(d.second))));
+    return LinearLayout(ll.getBases(), outDims, /*requireSurjective=*/false);
+  };
+  LinearLayout srcP = roundOutDimsToPow2(srcLL);
+  LinearLayout resP = roundOutDimsToPow2(resLL);
+
+  // invertAndCompose requires the (rounded) source to be surjective.
+  if (!srcP.isSurjective())
+    return std::nullopt;
+
+  // 3. Compose result registers onto source registers.
+  LinearLayout conv = resP.invertAndCompose(srcP);
+
+  // 4. Guard: the register out-component must depend only on the register
+  //    in-dim. If lane/warp/block leak into it, reject (loud) rather than
+  //    silently miscompute.
+  for (StringAttr other : {kLane, kWarp, kBlock}) {
+    if (conv.hasInDim(other) && !conv.sublayoutIsZero({other}, {kReg}))
+      return std::nullopt;
+  }
+  LinearLayout regConv = conv.sublayout({kReg}, {kReg});
+
+  const bool dbg = std::getenv("NPOT_DBG") != nullptr;
+  unsigned numResRegs = resP.getInDimSize(kReg);
+  SmallVector<Value> resultVals(numResRegs);
+  for (unsigned i = 0; i < numResRegs; ++i) {
+    int32_t srcIdx =
+        regConv.apply({{kReg, static_cast<int32_t>(i)}}).begin()->second;
+    if (srcIdx < 0 || static_cast<size_t>(srcIdx) >= srcVals.size())
+      return std::nullopt;
+    resultVals[i] = srcVals[srcIdx];
+    if (dbg)
+      llvm::errs() << "[NPOT view] resReg " << i << " <- srcReg " << srcIdx
+                   << "\n";
+  }
+  return resultVals;
 }
 
 struct SplatOpConversion : public ConvertOpToLLVMPattern<triton::SplatOp> {
@@ -329,6 +424,28 @@ struct ExpandDimsOpConversion : public ConvertOpToLLVMPattern<ExpandDimsOp> {
       return emitOptionalError(
           loc, "ExpandDimsOp only supports SliceEncodingAttr as its input");
     }
+
+    // NPOT: a modular layout's per-register offset map is ambiguous (free src
+    // registers), so route through the composition-based remap instead.
+    static const bool allowNpot =
+        ::mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    LinearLayout srcLL = triton::gpu::toLinearLayout(srcTy);
+    LinearLayout resultFullLL = triton::gpu::toLinearLayout(resultTy);
+    if (allowNpot && (srcLL.isModular() || resultFullLL.isModular())) {
+      // The result gains a size-1 dim at srcLayout.getDim(); drop it so src and
+      // result share the same out-dims for the composition.
+      LinearLayout resLL = removeStandardDim(resultFullLL, srcLayout.getDim());
+      auto remapped =
+          remapModularViewRegisters(op.getContext(), srcLL, resLL, srcVals);
+      if (!remapped)
+        return op.emitError(
+            "NPOT expand_dims: could not compose the modular layout remap");
+      Value ret =
+          packLLElements(loc, typeConverter, *remapped, rewriter, resultTy);
+      rewriter.replaceOp(op, ret);
+      return success();
+    }
+
     auto resultLayout = resultTy.getEncoding();
     auto srcOffsets = emitOffsetForLayout(srcLayout, srcTy);
     auto resultOffsets = emitOffsetForLayout(resultLayout, resultTy);
@@ -446,9 +563,41 @@ struct BroadcastOpConversion
     unsigned rank = srcTy.getRank();
     auto typeConverter = getTypeConverter();
     assert(rank == resultTy.getRank());
+    SmallVector<Value> srcVals = unpackLLElements(loc, src, rewriter);
+
+    // NPOT: a modular layout's per-register offset map is ambiguous (free src
+    // registers collapse onto one offset key), so route through the
+    // composition-based remap instead of the std::map offset match.
+    static const bool allowNpot =
+        ::mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    LinearLayout srcLL = triton::gpu::toLinearLayout(srcTy);
+    LinearLayout resultLL = triton::gpu::toLinearLayout(resultTy);
+    if (allowNpot && (srcLL.isModular() || resultLL.isModular())) {
+      // Drop every broadcast out-dim (srcShape[d]==1) from BOTH layouts,
+      // highest index first, so the remaining out-dims match. Result registers
+      // that differ only along a broadcast dim then map to the same source
+      // register.
+      LinearLayout projSrc = srcLL;
+      LinearLayout projRes = resultLL;
+      for (int d = static_cast<int>(rank) - 1; d >= 0; --d) {
+        if (srcShape[d] == 1) {
+          projSrc = removeStandardDim(projSrc, d);
+          projRes = removeStandardDim(projRes, d);
+        }
+      }
+      auto remapped =
+          remapModularViewRegisters(op.getContext(), projSrc, projRes, srcVals);
+      if (!remapped)
+        return op.emitError(
+            "NPOT broadcast: could not compose the modular layout remap");
+      Value resultStruct =
+          packLLElements(loc, typeConverter, *remapped, rewriter, resultTy);
+      rewriter.replaceOp(op, {resultStruct});
+      return success();
+    }
+
     auto srcOffsets = emitOffsetForLayout(srcLayout, srcTy);
     auto resultOffsets = emitOffsetForLayout(resultLayout, resultTy);
-    SmallVector<Value> srcVals = unpackLLElements(loc, src, rewriter);
     std::map<SmallVector<unsigned>, Value> srcValues;
     for (size_t i = 0; i < srcOffsets.size(); i++) {
       srcValues[srcOffsets[i]] = srcVals[i];
